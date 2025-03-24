@@ -1,0 +1,14 @@
+#Structure:
+├── traindata/
+│   ├── images/
+│   │   ├── train/
+│   │   ├── val/
+│   │   └── test/         
+│   └── labels/
+│       ├── train/
+│       ├── val/
+│       └── test/  
+#Portions:
+    train = 85%
+    val = 10%
+    test = 5%

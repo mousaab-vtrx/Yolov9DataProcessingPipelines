@@ -1,0 +1,7 @@
+path: /content/content/train_data
+train: images/train 
+val: images/val 
+test: images/test 
+
+nc: 3
+names: ['upper_clothes', 'lower_clothes','dresses']
