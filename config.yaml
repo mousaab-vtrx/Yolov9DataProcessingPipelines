@@ -1,4 +1,4 @@
-path: /content/content/train_data
+path: /content/train_data
 train: images/train 
 val: images/val 
 test: images/test 
