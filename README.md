@@ -1,2 +1,2 @@
-# Yolov9DataProcessingPipelines
+# Yolov9 Data Processing Pipelines
 This repository contains high-performance, robust scripts for preprocessing dress code dataset for YOLOv9 segmentation models. Designed with efficiency, these scripts work flawlessly, whether you're an expert, an average Joe or a complete beginner. Ensuring smooth execution with robust error handling and detailed logging.  Every script is carefully optimized for speed and accuracy, delivering clean, ready-to-use segmentation data with minimal effort. The well-structured code includes clear, insightful comments, making it easy to understand used concepts and modify, even for those unfamiliar with the technical details. No tweaking, no confusion, just results that work like a charm.
