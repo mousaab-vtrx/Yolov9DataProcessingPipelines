@@ -47,6 +47,7 @@ image_path = '050184_4.png'
 label_path = '050184_4.txt'
 class_colors = {
     0: (255, 0, 0),
-    1: (0, 255, 0)
+    1: (0, 255, 0),
+    2 :(0, 0, 255)
 }
 visualize_label(image_path, label_path, class_colors=class_colors)
