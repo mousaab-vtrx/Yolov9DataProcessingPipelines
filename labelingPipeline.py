@@ -12,7 +12,7 @@ import pydensecrf.densecrf as dcrf
 from pydensecrf.utils import unary_from_softmax
 from transformers import YolosImageProcessor, YolosForObjectDetection
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
+import argparse
 import warnings
 
 # Configure logging
@@ -30,38 +30,30 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*The parameter 'pretrained' is deprecated.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*You seem to be using the pipelines sequentially on GPU.*")
 
-# Constants for clothing categories
-LOWER_CLOTHES = {
-    "pants", "shorts", "skirt", "tights, stockings", "leg warmer"
-}
-UPPER_CLOTHES = {
-    "shirt, blouse", "top, t-shirt, sweatshirt", "sweater", "cardigan",
-    "jacket", "vest", "coat", "dress", "jumpsuit", "cape", "tie",
-    "scarf", "hoodie", "collar", "sleeve"
-}
+# Updated clothing categories and label mapping
+LOWER_CLOTHES = {"pants", "shorts", "skirt", "tights", "stockings", "leg warmer"}
+UPPER_CLOTHES = {"shirt", "blouse", "top", "t-shirt", "sweatshirt", "sweater", "cardigan",
+                 "jacket", "vest", "coat", "dress", "jumpsuit", "cape", "tie",
+                 "scarf", "hoodie", "collar", "sleeve"}
 EXCLUDED_LABELS = {"shoe", "neckline", "belt"}
-CLASS_NAMES = {0: "upper_clothes", 1: "lower_clothes"}
+# Adjust CLASS_NAMES: Assuming the segmentation model now supports three classes.
+CLASS_NAMES = {0: "upper_clothes", 1: "lower_clothes", 2: "dress"}
 CATEGORY_MAP = {
     "upper_clothes": "upper clothing",
-    "lower_clothes": "lower clothing"
+    "lower_clothes": "lower clothing",
+    "dress": "dress"
 }
 
-# Directory configuration
-INPUT_DIR = "/content/input_images"
-OUTPUT_ROOT = "/content/test_data"
-IMAGES_OUTPUT_DIR = os.path.join(OUTPUT_ROOT, "images")
-
-
 class ClothingSegmenter:
-    def __init__(self, model_path='/content/drive/MyDrive/OUSTORA_ONLY/yolov8_large_experiment_extended/weights/best.pt'):
+    def __init__(self, model_path, images_output_dir):
         """Initialize the clothing segmentation models."""
         logger.info("Initializing ClothingSegmenter")
         start_time = time.time()
-        
+        self.images_output_dir = images_output_dir
+
         try:
-            # Create output directories
-            os.makedirs(IMAGES_OUTPUT_DIR, exist_ok=True)
-            logger.info(f"Output directory created/confirmed: {IMAGES_OUTPUT_DIR}")
+            os.makedirs(self.images_output_dir, exist_ok=True)
+            logger.info(f"Output directory created/confirmed: {self.images_output_dir}")
             
             # Load YOLOS model for clothing detection
             try:
@@ -104,58 +96,22 @@ class ClothingSegmenter:
     def apply_crf(self, soft_mask, image, iterations=5):
         """
         Apply DenseCRF to refine the segmentation mask.
-        
-        Parameters:
-        - soft_mask: A 2D array with values in [0,1] representing the probability for the positive class.
-        - image: The original image (in BGR format).
-        - iterations: Number of inference iterations. More iterations can improve refinement but may slow processing.
-        
-        The DenseCRF is configured with two pairwise potentials:
-        1. Gaussian: Encourages spatial consistency.
-           - sxy: Standard deviation for the spatial kernel (default: 5). Increase for more smoothing.
-           - compat: Weight for the Gaussian term (default: 5). Increase to enforce stronger smoothing.
-        2. Bilateral: Encourages similarity in appearance and spatial closeness.
-           - sxy: Standard deviation for spatial kernel (default: 60). Adjust to control the area of influence.
-           - srgb: Standard deviation for color values (default: 10). Increase if colors vary too much.
-           - compat: Weight for the bilateral term (default: 15). Increase for stronger color-based smoothing.
         """
         try:
             h, w = soft_mask.shape
-
-            # Prepare probability map: shape (2, H, W)
-            # Channel 0: probability of background (1 - soft_mask)
-            # Channel 1: probability of foreground (soft_mask)
+            # Prepare probability map: 2 channels: background and foreground.
             probs = np.stack([1 - soft_mask, soft_mask], axis=0)
-            
-            # Initialize DenseCRF with image dimensions and 2 classes
             d = dcrf.DenseCRF2D(w, h, 2)
-            
-            # Convert soft probabilities into unary potentials
             U = unary_from_softmax(probs.astype(np.float32))
             d.setUnaryEnergy(U)
-            
-            # Add pairwise Gaussian potential for spatial smoothing
-            # sxy=5: Controls spatial kernel standard deviation.
-            # compat=5: Weight for the Gaussian term.
             d.addPairwiseGaussian(sxy=5, compat=5)
-            
-            # Convert image from BGR to RGB for bilateral potential
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            # Add pairwise Bilateral potential to enforce color similarity:
-            # sxy=60: Spatial standard deviation (larger value covers broader area).
-            # srgb=10: Color standard deviation (smaller value makes color matching stricter).
-            # compat=15: Weight for the bilateral term.
             d.addPairwiseBilateral(sxy=60, srgb=10, rgbim=image_rgb, compat=15)
-            
-            # Run CRF inference for a given number of iterations
             Q = d.inference(iterations)
-            
-            # Reshape Q to get the refined mask (taking argmax over classes)
             refined_mask = np.argmax(np.array(Q).reshape((2, h, w)), axis=0).astype(np.uint8)
             return refined_mask
         except Exception as e:
             logger.error(f"Error in apply_crf: {str(e)}")
-            # Return original mask as fallback
             return np.where(soft_mask > 0.5, 1, 0).astype(np.uint8)
 
     def get_dominant_colors(self, image, mask, k=3):
@@ -165,25 +121,17 @@ class ClothingSegmenter:
             if region_pixels.size == 0:
                 logger.warning("No pixels found in masked region for color extraction")
                 return []
-            
-            # Filter out white pixels
-            non_white = region_pixels[np.all(region_pixels < 250, axis=1)]
+            non_white = region_pixels[np.all(region_pixels < 230, axis=1)]
             if non_white.size == 0:
                 logger.warning("No non-white pixels found in masked region")
                 return []
-            
-            # Apply k-means clustering for color extraction
             data = np.float32(non_white)
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
             attempts = 10
             ret, labels, centers = cv2.kmeans(data, k, None, criteria, attempts, cv2.KMEANS_RANDOM_CENTERS)
             centers = centers.astype(int)
-            
-            # Count occurrences of each label and sort
             counts = np.bincount(labels.flatten())
             sorted_idx = np.argsort(-counts)
-            
-            # Convert to hex color codes
             dominant_colors = []
             for idx in sorted_idx:
                 bgr_color = centers[idx]
@@ -202,13 +150,12 @@ class ClothingSegmenter:
         logger.info(f"Processing image {index:02d}: {filename}")
         
         try:
-            # Load the original image
             orig_img = cv2.imread(image_path)
             if orig_img is None:
                 logger.error(f"Unable to read image: {image_path}")
                 return
             
-            # Remove background first
+            # Background removal
             try:
                 logger.debug("Removing background")
                 with open(image_path, "rb") as file:
@@ -219,8 +166,6 @@ class ClothingSegmenter:
                 if bg_removed_img is None:
                     logger.error("Failed to decode background-removed image")
                     return
-                
-                # Create binary mask from background-removed image
                 gray = cv2.cvtColor(bg_removed_img, cv2.COLOR_BGR2GRAY)
                 _, binary_mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
                 bg_removed_img = cv2.bitwise_and(bg_removed_img, bg_removed_img, mask=binary_mask)
@@ -229,60 +174,50 @@ class ClothingSegmenter:
                 logger.debug(traceback.format_exc())
                 return
 
-            # Perform YOLOv8 segmentation first to check for dress
+            # Initial segmentation to check for dress
             try:
-                logger.debug("Running YOLOv8 segmentation")
+                logger.debug("Running YOLOv8 segmentation for dress detection")
                 results = self.model_seg.predict(bg_removed_img, conf=0.5, iou=0.5)
-                if not (results and results[0].masks and results[0].masks.data is not None):
-                    logger.warning("No segmentation masks detected")
-                    return
-
                 is_dress = False
-                for class_id_tensor in results[0].boxes.cls:
-                    class_id = int(class_id_tensor.item())
-                    if CLASS_NAMES.get(class_id) == "dress":
-                        is_dress = True
-                        break
+                if results and results[0].boxes is not None:
+                    for class_id_tensor in results[0].boxes.cls:
+                        class_id = int(class_id_tensor.item())
+                        if CLASS_NAMES.get(class_id, "").lower() == "dress":
+                            is_dress = True
+                            break
 
                 if is_dress:
-                    # Handle dress case - process single mask
                     logger.info("Detected dress - processing as single item")
                     mask_tensor = results[0].masks.data[0]
                     mask_np = mask_tensor.cpu().numpy().astype(np.float32)
-                    
-                    # Resize and refine mask
                     soft_mask = cv2.resize(mask_np, (bg_removed_img.shape[1], bg_removed_img.shape[0]), 
-                                          interpolation=cv2.INTER_NEAREST)
+                                             interpolation=cv2.INTER_NEAREST)
                     soft_mask = np.clip(soft_mask, 0, 1)
                     refined_mask = self.apply_crf(soft_mask, bg_removed_img)
                     smoothed_mask = cv2.GaussianBlur(refined_mask.astype(np.float32), (17, 17), 0)
                     smoothed_mask = np.where(smoothed_mask > 0.5, 1, 0).astype(np.uint8)
                     cleaned_mask = self.keep_largest_connected_component(smoothed_mask)
-                    
-                    # Apply mask and save
                     segmented_output = np.where(cleaned_mask[:, :, None] == 1, bg_removed_img, 255)
                     colors = self.get_dominant_colors(bg_removed_img, cleaned_mask)
                     
-                    # Save segmented image
                     seg_filename = f"{index:02d}_dress.jpg"
-                    seg_output_path = os.path.join(IMAGES_OUTPUT_DIR, seg_filename)
+                    seg_output_path = os.path.join(self.images_output_dir, seg_filename)
                     cv2.imwrite(seg_output_path, segmented_output)
                     
-                    # Save metadata
                     metadata = {
                         "filename": seg_filename,
                         "category": "dress",
                         "colors": colors if colors else []
                     }
                     metadata_filename = f"{index:02d}_dress.json"
-                    metadata_path = os.path.join(IMAGES_OUTPUT_DIR, metadata_filename)
+                    metadata_path = os.path.join(self.images_output_dir, metadata_filename)
                     with open(metadata_path, 'w') as f:
                         json.dump(metadata, f, indent=2)
                     
-                    logger.info(f"  Saved dress segmentation as {seg_filename}")
-                    return  # Exit early since we've handled the dress case
+                    logger.info(f"Saved dress segmentation as {seg_filename}")
+                    return  # Exit early if dress is detected
 
-                # If not a dress, proceed with normal YOLOS detection and processing
+                # YOLOS clothing detection for additional info
                 try:
                     pil_image = Image.fromarray(cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB))
                     inputs_yolos = self.processor(images=pil_image, return_tensors="pt")
@@ -292,66 +227,51 @@ class ClothingSegmenter:
                     results_yolos = self.processor.post_process_object_detection(
                         outputs_yolos, threshold=0.9, target_sizes=target_sizes)[0]
                     
-                    # Process detected labels
                     lower_clothes_labels = set()
                     upper_clothes_labels = set()
                     for label in results_yolos["labels"]:
                         label_name = (self.model_yolos.config.id2label[label.item()]
-                                    if self.model_yolos.config.id2label else str(label.item()))
+                                      if self.model_yolos.config.id2label else str(label.item()))
                         if label_name in LOWER_CLOTHES:
                             lower_clothes_labels.add(label_name)
                         elif label_name in UPPER_CLOTHES:
                             upper_clothes_labels.add(label_name)
                     
-                    lower_description = " ".join(lower_clothes_labels)
-                    upper_description = " ".join(upper_clothes_labels)
-                    logger.info(f"  YOLOS detected lower clothing: {lower_description}")
-                    logger.info(f"  YOLOS detected upper clothing: {upper_description}")
+                    logger.info(f"YOLOS detected lower clothing: {' '.join(lower_clothes_labels)}")
+                    logger.info(f"YOLOS detected upper clothing: {' '.join(upper_clothes_labels)}")
                 except Exception as e:
                     logger.error(f"Error during YOLOS detection: {str(e)}")
                     logger.debug(traceback.format_exc())
                 
-                # Perform segmentation
+                # Perform segmentation for each detected mask
                 try:
-                    logger.debug("Running YOLOv8 segmentation")
+                    logger.debug("Running YOLOv8 segmentation for full processing")
                     results = self.model_seg.predict(bg_removed_img, conf=0.5, iou=0.5)
                     if not (results and results[0].masks and results[0].masks.data is not None):
                         logger.warning("No segmentation masks detected")
                         return
                     
-                    # Process each detected mask
                     for i, (mask_tensor, class_id_tensor) in enumerate(zip(results[0].masks.data, results[0].boxes.cls)):
                         class_id = int(class_id_tensor.item())
                         mask_np = mask_tensor.cpu().numpy().astype(np.float32)
-                        
-                        # Resize mask to match image dimensions
-                        soft_mask = cv2.resize(mask_np, (bg_removed_img.shape[1], bg_removed_img.shape[0]), 
-                                              interpolation=cv2.INTER_NEAREST)
+                        soft_mask = cv2.resize(mask_np, (bg_removed_img.shape[1], bg_removed_img.shape[0]),
+                                                 interpolation=cv2.INTER_NEAREST)
                         soft_mask = np.clip(soft_mask, 0, 1)
-                        
-                        # Refine mask using DenseCRF
-                        # Note: The number of iterations is set to 5 by default; adjust if needed.
                         logger.debug(f"Applying DenseCRF refinement for mask {i+1}")
                         refined_mask = self.apply_crf(soft_mask, bg_removed_img, iterations=5)
-                        
-                        # Smooth and clean the mask
                         smoothed_mask = cv2.GaussianBlur(refined_mask.astype(np.float32), (17, 17), 0)
                         smoothed_mask = np.where(smoothed_mask > 0.5, 1, 0).astype(np.uint8)
                         cleaned_mask = self.keep_largest_connected_component(smoothed_mask)
-                        
-                        # Apply mask to image
                         segmented_output = np.where(cleaned_mask[:, :, None] == 1, bg_removed_img, 255)
                         
-                        # Save segmented output
                         seg_filename = f"{index:02d}_{class_id}.jpg"
-                        seg_output_path = os.path.join(IMAGES_OUTPUT_DIR, seg_filename)
+                        seg_output_path = os.path.join(self.images_output_dir, seg_filename)
                         cv2.imwrite(seg_output_path, segmented_output)
-                        logger.info(f"  Saved segmentation as {seg_filename} (class: {CLASS_NAMES.get(class_id, class_id)})")
+                        logger.info(f"Saved segmentation as {seg_filename} (class: {CLASS_NAMES.get(class_id, class_id)})")
                         
-                        # Get color information (could be used for metadata)
                         colors = self.get_dominant_colors(bg_removed_img, cleaned_mask)
                         if colors:
-                            logger.debug(f"  Dominant colors: {colors}")
+                            logger.debug(f"Dominant colors: {colors}")
                 except Exception as e:
                     logger.error(f"Error during segmentation processing: {str(e)}")
                     logger.debug(traceback.format_exc())
@@ -364,32 +284,24 @@ class ClothingSegmenter:
             logger.error(f"Unhandled error processing {filename}: {str(e)}")
             logger.debug(traceback.format_exc())
 
-    def process_directory(self, max_workers=2):
-        """Process all images in the input directory."""
+    def process_directory(self, input_dir):
+        """Process all images in the input directory sequentially."""
         start_time = time.time()
-        logger.info(f"Starting batch processing of images from {INPUT_DIR}")
+        logger.info(f"Starting batch processing of images from {input_dir}")
         
         try:
-            # Get list of image files
-            image_files = sorted([f for f in os.listdir(INPUT_DIR)
-                                if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))])
+            image_files = sorted([f for f in os.listdir(input_dir)
+                                  if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))])
             
             if not image_files:
-                logger.warning(f"No images found in {INPUT_DIR}")
+                logger.warning(f"No images found in {input_dir}")
                 return
             
             logger.info(f"Found {len(image_files)} images to process")
             
-            # Process images using thread pool
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for idx, filename in enumerate(image_files):
-                    image_path = os.path.join(INPUT_DIR, filename)
-                    futures.append(executor.submit(self.process_image, image_path, idx))
-                
-                # Wait for all tasks to complete
-                for future in futures:
-                    future.result()
+            for idx, filename in enumerate(image_files):
+                image_path = os.path.join(input_dir, filename)
+                self.process_image(image_path, idx)
             
             logger.info(f"Batch processing completed in {time.time() - start_time:.2f} seconds")
             logger.info(f"Successfully processed {len(image_files)} images")
@@ -399,13 +311,20 @@ class ClothingSegmenter:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Clothing Segmentation Script")
+    parser.add_argument("--input_dir", type=str, default="/content/input_images", help="Directory with input images")
+    parser.add_argument("--output_dir", type=str, default="/content/test_data/images", help="Directory to save outputs")
+    parser.add_argument("--model_path", type=str, default="/content/drive/MyDrive/OUSTORA_ONLY/yolov8_large_experiment_extended/weights/best.pt", help="Path to YOLOv8 segmentation model")
+    args = parser.parse_args()
+
     try:
         logger.info("=== Starting Clothing Segmentation Script ===")
-        logger.info(f"Input Directory: {INPUT_DIR}")
-        logger.info(f"Output Directory: {IMAGES_OUTPUT_DIR}")
-        
-        segmenter = ClothingSegmenter()
-        segmenter.process_directory(max_workers=2)
+        logger.info(f"Input Directory: {args.input_dir}")
+        logger.info(f"Output Directory: {args.output_dir}")
+        logger.info(f"Model Path: {args.model_path}")
+
+        segmenter = ClothingSegmenter(args.model_path, os.path.dirname(args.output_dir))
+        segmenter.process_directory(args.input_dir)
         
         logger.info("=== Script execution completed successfully ===")
     except KeyboardInterrupt:
