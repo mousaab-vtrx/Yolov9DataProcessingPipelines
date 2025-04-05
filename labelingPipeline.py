@@ -207,7 +207,8 @@ class ClothingSegmenter:
                     metadata = {
                         "filename": seg_filename,
                         "category": "dress",
-                        "colors": colors if colors else []
+                        "colors": colors if colors else [],
+                        "description": "dress"
                     }
                     metadata_filename = f"{index:02d}_dress.json"
                     metadata_path = os.path.join(self.images_output_dir, metadata_filename)
@@ -217,7 +218,10 @@ class ClothingSegmenter:
                     logger.info(f"Saved dress segmentation as {seg_filename}")
                     return  # Exit early if dress is detected
 
-                # YOLOS clothing detection for additional info
+                # --- YOLOS detection for additional info ---
+                # Initialize the label sets so they are available later.
+                lower_clothes_labels = set()
+                upper_clothes_labels = set()
                 try:
                     pil_image = Image.fromarray(cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB))
                     inputs_yolos = self.processor(images=pil_image, return_tensors="pt")
@@ -227,8 +231,6 @@ class ClothingSegmenter:
                     results_yolos = self.processor.post_process_object_detection(
                         outputs_yolos, threshold=0.9, target_sizes=target_sizes)[0]
                     
-                    lower_clothes_labels = set()
-                    upper_clothes_labels = set()
                     for label in results_yolos["labels"]:
                         label_name = (self.model_yolos.config.id2label[label.item()]
                                       if self.model_yolos.config.id2label else str(label.item()))
@@ -237,13 +239,13 @@ class ClothingSegmenter:
                         elif label_name in UPPER_CLOTHES:
                             upper_clothes_labels.add(label_name)
                     
-                    logger.info(f"YOLOS detected lower clothing: {' '.join(lower_clothes_labels)}")
-                    logger.info(f"YOLOS detected upper clothing: {' '.join(upper_clothes_labels)}")
+                    logger.info(f"YOLOS detected lower clothing: {' '.join(lower_clothes_labels) if lower_clothes_labels else 'None'}")
+                    logger.info(f"YOLOS detected upper clothing: {' '.join(upper_clothes_labels) if upper_clothes_labels else 'None'}")
                 except Exception as e:
                     logger.error(f"Error during YOLOS detection: {str(e)}")
                     logger.debug(traceback.format_exc())
                 
-                # Perform segmentation for each detected mask
+                # --- Segmentation for each detected mask for non-dress items ---
                 try:
                     logger.debug("Running YOLOv8 segmentation for full processing")
                     results = self.model_seg.predict(bg_removed_img, conf=0.5, iou=0.5)
@@ -270,8 +272,30 @@ class ClothingSegmenter:
                         logger.info(f"Saved segmentation as {seg_filename} (class: {CLASS_NAMES.get(class_id, class_id)})")
                         
                         colors = self.get_dominant_colors(bg_removed_img, cleaned_mask)
-                        if colors:
-                            logger.debug(f"Dominant colors: {colors}")
+                        
+                        # Create metadata JSON file
+                        if CLASS_NAMES.get(class_id, "").lower() == "dress":
+                            # For dress, description is always "dress"
+                            description = "dress"
+                        elif CLASS_NAMES.get(class_id, "").lower() == "lower_clothes":
+                            description = " ".join(lower_clothes_labels) if lower_clothes_labels else ""
+                        elif CLASS_NAMES.get(class_id, "").lower() == "upper_clothes":
+                            description = " ".join(upper_clothes_labels) if upper_clothes_labels else ""
+                        else:
+                            description = ""
+                        
+                        metadata = {
+                            "filename": seg_filename,
+                            "category": CATEGORY_MAP.get(CLASS_NAMES.get(class_id, ""), ""),
+                            "colors": colors if colors else [],
+                            "description": description
+                        }
+                        
+                        metadata_filename = f"{index:02d}_{class_id}.json"
+                        metadata_path = os.path.join(self.images_output_dir, metadata_filename)
+                        with open(metadata_path, 'w') as f:
+                            json.dump(metadata, f, indent=2)
+                        logger.info(f"Saved metadata file {metadata_filename}")
                 except Exception as e:
                     logger.error(f"Error during segmentation processing: {str(e)}")
                     logger.debug(traceback.format_exc())
@@ -323,6 +347,7 @@ if __name__ == "__main__":
         logger.info(f"Output Directory: {args.output_dir}")
         logger.info(f"Model Path: {args.model_path}")
 
+        # Use the directory part of output_dir as images_output_dir if needed
         segmenter = ClothingSegmenter(args.model_path, os.path.dirname(args.output_dir))
         segmenter.process_directory(args.input_dir)
         
